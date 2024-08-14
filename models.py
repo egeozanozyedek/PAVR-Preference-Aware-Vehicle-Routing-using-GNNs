@@ -1,118 +1,58 @@
+from warnings import deprecated
 import torch
+from torch import nn
 from sklearn.neighbors import kneighbors_graph
+import numpy as np
+from gurobipy import *
+from torch_geometric.nn import SAGEConv, GATConv, DenseSAGEConv, GATv2Conv, DenseGATConv
+from torch_geometric.data import Data, Batch
+from helper_functions import make_onehot, cs_sparsify, knn_sparsify
 
 print(torch.__version__)
 
-from torch import nn, optim
-import torch.nn.functional as f
-from torch.autograd import Variable
-import torch.utils.data as data_utils
-from torch.utils.data.dataset import Dataset
-
-
-from sklearn.preprocessing import StandardScaler
-import pandas as pd
-import numpy as np
-import re
-from gurobipy import *
-import datetime
-import logging
-from sklearn.preprocessing import OneHotEncoder
-from sklearn.preprocessing import MinMaxScaler
-from scipy.special import softmax, log_softmax
-from inspect import signature
-from collections import OrderedDict
 dtype = torch.float
 device =torch.device("cpu")
-import logging
-import warnings
-from torch_geometric.nn import SAGEConv, GATConv, DenseSAGEConv, GATv2Conv, DenseGATConv
-from torch_geometric.data import Data, Batch
 
 
 
-# for cvrp baseline: random solver for comparison, easy to implement heuristic, min distance, the cvrp paper by prof guns
-# for friday, intro edits + visualize the solutions
-# for wednesday re-think RQ's, get feedback and
 
-
-def make_onehot(vec,num_classes):
-    vec_ =  vec.reshape(len(vec), 1)
-
-    one_hot_target = (vec_ == torch.arange(num_classes).reshape(1, num_classes)).float()
-    return one_hot_target
-
-
-
-def cs_sparsify(x, mask, threshold=0):
-    x = torch.nn.functional.normalize(x, p=2, dim=1)
-    connections = torch.mm(x, x.t()).fill_diagonal_(0)
-    # print(connections[0])
-    connections = connections > threshold
-    connections[0] = 1
-    connections = connections * mask
-
-    return np.argwhere(connections == 1)
-
-
-def knn_sparsify(distance_matrix, k, stops):
-    num_nodes = distance_matrix.shape[0]
-    adj = np.zeros((num_nodes, num_nodes), dtype=int)
-
-    for i in stops:
-        adj[i, i] = 0
-        subset_distances = distance_matrix[i, stops]
-        neighbors_idx = np.argsort(subset_distances)[:k + 1]
-        actual_neighbors = [stops[idx] for idx in neighbors_idx if stops[idx] != i]
-        for neighbor in actual_neighbors:
-            adj[i, neighbor] = 1
-
-    return torch.from_numpy(np.argwhere(adj == 1)).t()
-
-
-class GATBased(nn.Module):
+class PAVREncoderDecoder(nn.Module):
     def __init__(self,
-                 stop_embedding_size=12,
                  nnodes=74,
                  gnn_repr_size=32,
                  edge_repr_size=32,
-                 nweekdays=7,
                  drop_prob=0.1,
                  attention_heads=8,
                  feat_emb_size=3,
-                 sparsify = 1
+                 sparsify = 1,
+                 mweekdays=7,
+                 mvehicles=15,
+                 mcapacity=26
                  ):
         super().__init__()
 
-        self.nweekdays = nweekdays
         self.nnodes = nnodes
         self.model_name = "GAT"
         self.model_specs = (gnn_repr_size, edge_repr_size, attention_heads, feat_emb_size)
 
-        # self.demand_emb = nn.Embedding(nnodes, stop_embedding_size)
         self.stop_embedding = nn.Embedding(self.nnodes, feat_emb_size)
-        self.demand_emb = nn.Embedding(13, 2)
-        self.demand_lin = nn.Linear(2, feat_emb_size)
-        self.vehicle_emb = nn.Embedding(15, feat_emb_size)
-        self.capacity_emb = nn.Embedding(26, feat_emb_size)
-        self.weekday_emb = nn.Embedding(nweekdays, feat_emb_size)
-        self.stop_emb = nn.Embedding(nnodes, feat_emb_size)
+        self.vehicle_emb = nn.Embedding(mvehicles, feat_emb_size)
+        self.capacity_emb = nn.Embedding(mcapacity, feat_emb_size)
+        self.weekday_emb = nn.Embedding(mweekdays, feat_emb_size)
 
-
-        self.pregnn = DenseGATConv(1, gnn_repr_size)
+        self.sparsify = sparsify
         self.gnn1 = GATConv(1, gnn_repr_size, edge_dim=1, heads=attention_heads, dropout=drop_prob)
         self.gnn2 = GATConv(attention_heads * gnn_repr_size, gnn_repr_size, edge_dim=1, heads=attention_heads, dropout=drop_prob)
-
-        self.dropout = nn.Dropout(p=drop_prob)
 
         self.edge_summarizer = nn.Linear(2 * (gnn_repr_size * attention_heads),  edge_repr_size)
 
         input_length = self.nnodes * edge_repr_size + self.nnodes + self.nnodes + feat_emb_size*3 + self.nnodes
-        print(input_length)
+
         self.combiner1 = nn.Linear(input_length, nnodes)
         self.combiner2 = nn.Linear(nnodes, nnodes)
 
-        self.sparsify = sparsify
+        self.dropout = nn.Dropout(p=drop_prob)
+
 
     def forward(self, features, mask):
 
@@ -123,17 +63,6 @@ class GATBased(nn.Module):
 
         x = demand.view(self.nnodes, -1)
         # print(f"x in:{x[:5]} || {x[:5].shape} || {x[:5].ndim}")
-
-        # x = self.demand_emb(x)
-        # x = self.demand_lin(x)
-        # x = torch.tanh(x)
-        # x = x.view(1, self.nnodes, -1).double()
-        # mask = mask.view(1, self.nnodes, self.nnodes).int()
-        # print(x.shape, x.dtype)
-        # print(mask.dtype)
-        # x = self.pregnn(x, mask)
-        # print(f"x out intro:{x[:5]} || {x[:5].shape} || {x[:5].ndim}")
-
 
 
         if self.sparsify == 0:
@@ -147,37 +76,28 @@ class GATBased(nn.Module):
             mm = mask * mm
             edge_index = np.argwhere(mm == 1)
 
-
-        # print(f"ei in gnn2:{edge_index}")
         row, col = edge_index
         edge_attr = markov[row, col].to(torch.double)
 
-        # print(np.unique(edge_index), stops, mask)
-        # print(f"ei in gnn1:{edge_index}")
-
+        # print(f"ei after sparse:{edge_index}")
 
         x = self.gnn1(x.double(), edge_index, edge_attr.double())
         x = torch.relu(x)
-        # print(f"x out gnn1:{x[:5]} || {x[:5].shape} || {x[:5].ndim}")
-
-
         x = self.gnn2(x, edge_index, edge_attr)
         x = torch.relu(x)
 
-        # print(f"x out gnn2:{x[:5]} || {x[:5].shape} || {x[:5].ndim}")
+        # print(f"x out GAT:{x[:5]} || {x[:5].shape} || {x[:5].ndim}")
 
-        # print(x[0], x[31])
 
         i, j = torch.meshgrid(torch.arange(self.nnodes), torch.arange(self.nnodes), indexing='ij')
-        i = i.reshape(-1)  # Flatten the index tensors
-        j = j.reshape(-1)  # Flatten the index tensors
+        i = i.reshape(-1)
+        j = j.reshape(-1)
 
         edge_repr = torch.cat((x[i], x[j]), dim=1).reshape(self.nnodes, self.nnodes, -1)
         # edge_repr = edge_repr * mask.unsqueeze(-1)
         # edge_repr[mask, mask, :] = 0
 
         edge_repr = edge_repr.reshape(self.nnodes * self.nnodes, -1)
-
         edge_repr = self.edge_summarizer(edge_repr)
         # edge_repr = torch.relu(edge_repr)
         # edge_repr = self.dropout(edge_repr)
@@ -187,7 +107,6 @@ class GATBased(nn.Module):
 
 
         weekday_feat = self.weekday_emb(torch.tensor(weekday)).expand(self.nnodes, -1)
-        # print(capacity)
         capacity_feat = self.capacity_emb(torch.tensor(capacity)).expand(self.nnodes, -1)
         vehicle_feat = self.vehicle_emb(torch.tensor(vehicles)).expand(self.nnodes, -1)
 
@@ -201,10 +120,18 @@ class GATBased(nn.Module):
         # print(weekday_feat.shape, capacity_feat, vehicle_feat)
 
 
-        combined_feat = torch.cat([edge_repr, dist, markov, weekday_feat, capacity_feat, vehicle_feat, stop_feat], dim=1).to(dtype=torch.float32)
+        combined_feat = torch.cat([
+            edge_repr,
+            dist,
+            markov,
+            weekday_feat,
+            capacity_feat,
+            vehicle_feat,
+            stop_feat
+        ], dim=1).to(dtype=torch.float32)
 
         out = self.combiner1(combined_feat.double())
-        out = torch.relu(out)
+        out = torch.relu(out) # this layer can be relu or sigmoid, last layer, while in inference, will be sigmoid to obtain probabilities.
         out = self.combiner2(out)
         # print(f"out :{out[:5, :5]} || {out[:5, :5].shape} || {out[:5, :5].ndim}")
 
@@ -213,6 +140,65 @@ class GATBased(nn.Module):
 
 
 
+class MarkovCounting:
+
+    def __init__(self, alpha=0.01, beta=0.5, weight_schema=1):
+        self.T = {}
+        self.D = None
+        self.alpha = alpha
+        self.beta = beta
+        self.weight_schema = weight_schema
+        self.exp = 0.01
+        self.specs=(alpha,beta,weight_schema)
+
+        if weight_schema == 0:
+            self.weight = lambda x, y: 1  #
+        elif weight_schema == 1:
+            self.weight = lambda x, y: x / y  # time based
+        elif weight_schema == 2:
+            self.weight = lambda A, B: float(len(A.intersection(B))) / len(A.union(B))  # jaccard
+
+    def fit(self, historical_transitions, weekdays, distance_mat):
+        C = np.exp(-distance_mat)
+        np.fill_diagonal(C, 0)
+        self.D = C / np.sum(C, axis=1, keepdims=True)
+
+        # C = np.sum(distance_mat, axis=1, keepdims=True) / distance_mat
+        # np.fill_diagonal(C, 0)
+        #
+        # self.D = C / np.sum(C, axis=1, keepdims=True)
+        # np.fill_diagonal(self.D, 0)
+
+        for d in np.unique(weekdays):
+
+            if self.weight_schema == 0:
+                F = np.sum(historical_transitions[weekdays == d], axis=0)
+
+
+            if self.weight_schema == 1:
+
+                N = len(historical_transitions[weekdays == d])
+                weights = np.flip(np.arange(N))
+                weights = self.exp ** weights
+                F = np.sum(historical_transitions[weekdays == d] * weights[:, np.newaxis, np.newaxis], axis=0)
+
+            F += self.alpha
+
+            totals = np.sum(F, axis=1, keepdims=True)
+            self.T[d] = F / totals
+
+        return self.T, self.D
+
+    def predict(self, weekday):
+
+        return self.T[weekday] * self.beta + (1 - self.beta) * self.D
+
+
+
+
+
+
+@deprecated
 class SAGEBased(nn.Module):
     def __init__(self,
                  stop_embedding_size=12,
@@ -337,7 +323,7 @@ class SAGEBased(nn.Module):
 
 
 
-
+@deprecated
 class EGL(nn.Module):
     def __init__(self,
                  lookback_period = 30,
@@ -449,9 +435,7 @@ class EGL(nn.Module):
 
 
 
-
-
-
+@deprecated
 class GNNSAGE(nn.Module):
     def __init__(self, embedding_size,
                  lookback_period, stop_embedding_size=12, target_dim=1, nnodes=74, n_features=2,
@@ -559,7 +543,7 @@ class GNNSAGE(nn.Module):
         return batched_data
 
 
-
+@deprecated
 class GNNAttention(nn.Module):
     def __init__(self, embedding_size,
                  lookback_period, stop_embedding_size=12, target_dim=1, nnodes=74, n_features=2,
