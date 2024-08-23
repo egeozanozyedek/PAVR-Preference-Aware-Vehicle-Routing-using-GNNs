@@ -1,23 +1,32 @@
 import copy
-import os
 from datetime import datetime
-import logging
 import pandas as pd
 import numpy as np
 from gnn_trainer import PAVR
 from models import PAVREncoderDecoder
 from data_process import obtain_data
+import argparse
 
-os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+# cmd arguments
+parser = argparse.ArgumentParser()
+parser.add_argument("--eta_w", default=0.01, type=float)
+parser.add_argument("--eta_t", default=0.01, type=float)
+parser.add_argument("--lookback", default=30, type=int)
+parser.add_argument("--d1", default=32, type=int)
+parser.add_argument("--d2", default=32, type=int)
+parser.add_argument("--d3", default=3, type=int)
+parser.add_argument("--attn_heads", default=8, type=int)
+parser.add_argument("--beta", default=0.5, type=float)
+parser.add_argument("--epochs_w", default=10, type=int)
+parser.add_argument("--epochs_t", default=10, type=int)
+parser.add_argument("--warmup", default=True, type=bool)
 
-formatter = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+args = parser.parse_args()
 
-logging.basicConfig(filename='runs/PaddedModel.log', level=logging.INFO, format=formatter)
-
+# obtain data from the dataset
 stops, n_vehicles, weekday, capacities, demands, opmat, stop_wise_days, distance_mat, edge_mat = obtain_data("data")
 
-test_days = np.arange(151, 201, 1)
-
+# split train-test
 split = int(len(opmat) * 0.75)
 print(split)
 
@@ -43,19 +52,25 @@ daily_vehicles = n_vehicles
 daily_demands = demands
 daily_capacities = capacities
 
-lookback = 30
-stop_embedding_size = 32
+print(args.d1, args.d2, args.d3, args.attn_heads, args.beta)
 
-print(max(capacities))
+# define the encoder-decoder model
+pavrED = PAVREncoderDecoder(mvehicles=(max(n_vehicles) + 1),
+                            mcapacity=(max(capacities) + 1),
+                            gnn_repr_size=args.d1,
+                            edge_repr_size=args.d2,
+                            attention_heads=args.attn_heads,
+                            feat_emb_size=args.d3)
 
-pavr = PAVR(model=PAVREncoderDecoder(mvehicles=max(n_vehicles), mcapacity=max(capacities)),
-            lookback_period=lookback)
 
-epochs = 10
-learning_rate = 1e-2
-warm_up = True
+# define the entire model pipeline and training
+pavr = PAVR(model=pavrED,
+            lookback_period=args.lookback,
+            beta=args.beta)
 
-if warm_up:
+
+# if warmup is desired
+if args.warmup:
     in_model, in_markov = pavr.fit(distance_mat,
                                    training_stops,
                                    training_weekdays,
@@ -63,15 +78,19 @@ if warm_up:
                                    training_days,
                                    training_demands,
                                    training_capacities,
-                                   epochs=epochs,
-                                   learning_rate=learning_rate)
+                                   epochs=args.epochs_w,
+                                   learning_rate=args.eta_w)
+
 else:
     in_model = pavr.model
     in_markov = pavr.markov_model
 
-lst = []
-lookback = 30
-trial_name = "GAT_Demands_CosSim_NoInitEmbed"
+
+# inference
+lookback = args.lookback
+trial_name = "PAVR"
+results = []
+
 for i in range(len(test_days)):
     day = int(i + split + 1)
 
@@ -79,8 +98,6 @@ for i in range(len(test_days)):
     ts = test_stops[i]
     tw = test_weekdays[i]
     tv = test_vehicles[i]
-
-    print("aa", (day - lookback), day)
 
     primer = (distance_mat,
               daily_stops[(day - lookback):day],
@@ -91,63 +108,43 @@ for i in range(len(test_days)):
               capacities[(day - lookback):day],
               copy.deepcopy(in_model),
               copy.deepcopy(in_markov),
-              10,
-              0.01)
+              args.epochs_t,
+              args.eta_t)
 
     dems = demands[day]
     cap = capacities[day]
 
-    # Below is a setup used to obtain the results for the toy example in the thesis
-    # primer = None
-    # td = np.zeros_like(td)
-    # td[0, 3] = 1
-    # td[0, 4] = 1
-    # td[1, 2] = 1
-    # td[2, 0] = 1
-    # td[3, 1] = 1
-    # td[4, 0] = 1
-    #
-    # print(td[:5, :5])
-    # print(ts)
-    # ts = [0, 1, 2, 3, 4]
-    # print(ts)
-    # tv = 2
-    # tw = 1
-    # dems = np.zeros_like(demands[day])
-    # dems[1] = 2
-    # dems[2] = 3
-    # dems[3] = 2
-    # dems[4] = 9
-    # cap = 10
-    # print(tv, td, tw)
-    # print(demands[day])
-    # print(capacities[day])
+    # Inject toy example code here, found below.
 
     ev = pavr.predict(distance_mat, ts, tw, tv, td, dems, cap, primer)
 
-    rez = {"Name": trial_name,
+    out = {"Name": trial_name,
            "Day": day,
-           "lookback": lookback,
-           "epochs": epochs, "lr": learning_rate,
+           "lookback": args.lookback,
+           "epochs_w": args.epochs_w,
+           "epochs_t": args.epochs_t,
+           "lr_w": args.eta_w,
+           "lr_t": args.eta_t,
            "Model": in_model.model_name,
            "Model_Specs": in_model.model_specs,
            "Markov_Specs": in_markov.specs,
            "bceloss": ev[2],
            "training_bcelos": ev[3],
-           "Arc Difference": ev[0][0], "Arc Difference(%)": ev[0][1],
+           "Arc Difference": ev[0][0],
+           "Arc Difference(%)": ev[0][1],
            "Route Difference": ev[1][0],
            "Route Difference(%)": ev[1][1],
            "Distance": ev[4],
            "Comment": ev[5],
            }
 
-    print(rez)
-    lst.append(rez)
+    print(out)
+    results.append(out)
 
-df = pd.DataFrame(lst)
+df = pd.DataFrame(results)
 df.to_csv(f"PAVR Trial - {datetime.now()}.csv", sep=',', index=True, encoding='utf-8')
 
-# df = pd.read_csv("embedded_demands.csv", sep=',',)
+# df = pd.read_csv("??.csv", sep=',',)
 
 filtered_df = df.loc[df['Model'] == in_model.model_name]
 print(f"--Model: {in_model.model_name}")
@@ -157,3 +154,30 @@ print(f"Arc Diff: {filtered_df['Arc Difference'].mean()}")
 print(f"Arc Diff %: {filtered_df['Arc Difference(%)'].mean() * 100}")
 print(f"Route Diff: {filtered_df['Route Difference'].mean()}")
 print(f"Route Diff %: {filtered_df['Route Difference(%)'].mean() * 100}")
+
+
+# Below is a setup used to obtain the results for the toy example in the thesis. Should be put in where the above comment is.
+# primer = None
+# td = np.zeros_like(td)
+# td[0, 3] = 1
+# td[0, 4] = 1
+# td[1, 2] = 1
+# td[2, 0] = 1
+# td[3, 1] = 1
+# td[4, 0] = 1
+#
+# print(td[:5, :5])
+# print(ts)
+# ts = [0, 1, 2, 3, 4]
+# print(ts)
+# tv = 2
+# tw = 1
+# dems = np.zeros_like(demands[day])
+# dems[1] = 2
+# dems[2] = 3
+# dems[3] = 2
+# dems[4] = 9
+# cap = 10
+# print(tv, td, tw)
+# print(demands[day])
+# print(capacities[day])

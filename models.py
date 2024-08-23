@@ -1,4 +1,4 @@
-from warnings import deprecated
+from typing_extensions import deprecated
 import torch
 from torch import nn
 from sklearn.neighbors import kneighbors_graph
@@ -32,7 +32,7 @@ class PAVREncoderDecoder(nn.Module):
         super().__init__()
 
         self.nnodes = nnodes
-        self.model_name = "GAT"
+        self.model_name = "PAVR"
         self.model_specs = (gnn_repr_size, edge_repr_size, attention_heads, feat_emb_size)
 
         self.stop_embedding = nn.Embedding(self.nnodes, feat_emb_size)

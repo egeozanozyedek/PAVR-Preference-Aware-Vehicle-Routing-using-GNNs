@@ -25,13 +25,14 @@ class PAVR:
                  model=None,
                  lookback_period=30,
                  nnodes=74,
-                 optimizer=optim.Adam):
+                 optimizer=optim.Adam,
+                 beta = 0.5):
 
         self.lookback_period = lookback_period
         self.nnodes = nnodes
         self.optimizer = optimizer
         self.criterion = nn.BCEWithLogitsLoss()
-        self.markov_model = MarkovCounting()
+        self.markov_model = MarkovCounting(beta = beta)
         self.training_loss = 0
         self.model = model
 
@@ -65,9 +66,10 @@ class PAVR:
         self.training_loss = 0
         training_loss = []
 
-        distance_mat = torch.from_numpy(distance_mat)
+
 
         markov_model.fit(training_days, training_weekdays, distance_mat)
+        distance_mat = torch.from_numpy(distance_mat)
 
 
         # training
